@@ -21,21 +21,30 @@ type Store struct {
 	inner         storage.DoltStorage
 	locateProject ProjectLocator
 	openProject   StoreOpener
+	routeIssues   IssueRouter
 	warnProject   func(ProjectName)
+	warnIssue     func(string, error)
 	warnMu        sync.Mutex
 	warned        map[ProjectName]struct{}
+	warnedIssues  map[string]struct{}
 }
 
 // New constructs an external-capability-aware storage decorator.
-func New(inner storage.DoltStorage, locateProject ProjectLocator, openProject StoreOpener) *Store {
-	return &Store{
+func New(inner storage.DoltStorage, locateProject ProjectLocator, openProject StoreOpener, opts ...Option) *Store {
+	s := &Store{
 		DoltStorage:   inner,
 		inner:         inner,
 		locateProject: locateProject,
 		openProject:   openProject,
 		warnProject:   defaultProjectWarning,
+		warnIssue:     defaultIssueWarning,
 		warned:        make(map[ProjectName]struct{}),
+		warnedIssues:  make(map[string]struct{}),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Unwrap exposes the decorated store to storage.UnwrapStore.
@@ -109,6 +118,18 @@ func (s *Store) warnUnresolvedProject(project ProjectName) {
 	}
 }
 
+func (s *Store) warnUnresolvedIssue(id string, err error) {
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	if _, warned := s.warnedIssues[id]; warned {
+		return
+	}
+	s.warnedIssues[id] = struct{}{}
+	if s.warnIssue != nil {
+		s.warnIssue(id, err)
+	}
+}
+
 type blockingState struct {
 	refsByIssue map[string][]string
 }
@@ -136,7 +157,7 @@ func (s *Store) blockingStateFromRecords(ctx context.Context, allDeps map[string
 	refsByIssue := make(map[string][]string)
 	for issueID, deps := range allDeps {
 		for _, dep := range deps {
-			if dep == nil || !dep.Type.IsBlockingEdge() || !isExternalReference(dep.DependsOnID) {
+			if !isManagedBlocker(issueID, dep) {
 				continue
 			}
 			refs = append(refs, parseReference(dep.DependsOnID))
@@ -163,6 +184,14 @@ func (s *Store) blockingStateFromRecords(ctx context.Context, allDeps map[string
 	}
 
 	return blockingState{refsByIssue: refsByIssue}, nil
+}
+
+// Keep the existing external capability policy for every blocking edge type;
+// only cross-prefix blocks have the simple target-status semantics used here.
+func isManagedBlocker(sourceID string, dep *types.Dependency) bool {
+	return dep != nil && dep.Type.IsBlockingEdge() &&
+		(isExternalReference(dep.DependsOnID) ||
+			(dep.Type == types.DepBlocks && isForeignTarget(sourceID, dep.DependsOnID)))
 }
 
 // GetReadyWork excludes sources with unsatisfied external blocking edges.

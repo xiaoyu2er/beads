@@ -53,6 +53,7 @@ func wireExternalDependencyPolicy(store storage.DoltStorage) storage.DoltStorage
 		func(ctx context.Context, projectRoot string) (storage.DoltStorage, error) {
 			return newReadOnlyStoreFromConfig(ctx, filepath.Join(projectRoot, ".beads"))
 		},
+		externaldeps.WithIssueRouter(lookupRoutedBlockers),
 	)
 }
 

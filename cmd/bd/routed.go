@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/debug"
@@ -160,40 +161,71 @@ func resolveViaPrefixRouting(ctx context.Context, id string) (*RoutedResult, err
 // the command inside that rig; false keeps the read-only open that guarantees a
 // routed read cannot mutate the target (bd-6dnrw.32).
 func resolveViaPrefixRoutingWithAccess(ctx context.Context, id string, writable bool) (*RoutedResult, error) {
+	route, townRoot, err := findPrefixRoute(id)
+	if err != nil {
+		return nil, err
+	}
+	targetStore, err := openPrefixRoute(ctx, route, townRoot, writable)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := resolveAndGetFromStore(ctx, targetStore, id, true)
+	if err != nil {
+		_ = targetStore.Close()
+		return nil, err
+	}
+	result.closeFn = func() { _ = targetStore.Close() }
+
+	if os.Getenv("BD_DEBUG_ROUTING") != "" {
+		fmt.Fprintf(os.Stderr, "[routing] Resolved %s via prefix route to %s\n", id, route.Path)
+	}
+
+	return result, nil
+}
+
+// findPrefixRoute returns the routes.jsonl entry for id, read from the
+// current beads directory, and the town root its path is relative to. A route
+// back to the current database (path ".") is an error: the caller has
+// already looked there.
+func findPrefixRoute(id string) (*prefixRoute, string, error) {
 	if strings.Index(id, "-") <= 0 {
-		return nil, fmt.Errorf("no prefix in ID %q", id)
+		return nil, "", fmt.Errorf("no prefix in ID %q", id)
 	}
 
 	// Find the resolved beads directory (where routes.jsonl lives)
 	currentBeadsDir := resolveCommandBeadsDir(dbPath)
 	if currentBeadsDir == "" {
-		return nil, fmt.Errorf("no beads directory available")
+		return nil, "", fmt.Errorf("no beads directory available")
 	}
 
 	// Load routes from routes.jsonl
 	routes, err := loadPrefixRoutes(currentBeadsDir)
 	if err != nil || len(routes) == 0 {
-		return nil, fmt.Errorf("no routes available")
+		return nil, "", fmt.Errorf("no routes available")
 	}
 
 	// Find the most specific route for this ID
 	matchedRoute := matchPrefixRoute(routes, id)
 	if matchedRoute == nil {
-		return nil, fmt.Errorf("no route for ID %q", id)
+		return nil, "", fmt.Errorf("no route for ID %q", id)
 	}
-	prefix := matchedRoute.Prefix
 
 	// Skip if the route points to current directory (town-level, already checked)
 	if matchedRoute.Path == "." {
-		return nil, fmt.Errorf("route points to current database")
+		return nil, "", fmt.Errorf("route points to current database")
 	}
 
 	// Derive the town root from the current beads dir.
 	// currentBeadsDir is typically <town_root>/.beads
-	townRoot := filepath.Dir(currentBeadsDir)
+	return matchedRoute, filepath.Dir(currentBeadsDir), nil
+}
 
+// openPrefixRoute opens the database a route points at. Read-only unless
+// writable, so a routed read can never mutate the target.
+func openPrefixRoute(ctx context.Context, route *prefixRoute, townRoot string, writable bool) (storage.DoltStorage, error) {
 	// Resolve the target rig's .beads directory
-	rigDir := filepath.Join(townRoot, matchedRoute.Path)
+	rigDir := filepath.Join(townRoot, route.Path)
 	targetBeadsDir := beads.FollowRedirect(filepath.Join(rigDir, ".beads"))
 
 	// Check that the target has a different dolt_database
@@ -202,7 +234,7 @@ func resolveViaPrefixRoutingWithAccess(ctx context.Context, id string, writable 
 		return nil, fmt.Errorf("target rig has no dolt_database configured")
 	}
 
-	debug.Logf("[routing] Prefix %q matched route to %s (database: %s)\n", prefix, matchedRoute.Path, targetDB)
+	debug.Logf("[routing] Prefix %q matched route to %s (database: %s)\n", route.Prefix, route.Path, targetDB)
 
 	// We need to temporarily override BEADS_DOLT_SERVER_DATABASE so server-mode
 	// stores connect to the correct database on the shared Dolt server.
@@ -222,21 +254,71 @@ func resolveViaPrefixRoutingWithAccess(ctx context.Context, id string, writable 
 		_ = os.Unsetenv("BEADS_DOLT_SERVER_DATABASE")
 	}
 	if openErr != nil {
-		return nil, fmt.Errorf("opening routed store for %s: %w", matchedRoute.Path, openErr)
+		return nil, fmt.Errorf("opening routed store for %s: %w", route.Path, openErr)
 	}
+	return targetStore, nil
+}
 
-	result, err := resolveAndGetFromStore(ctx, targetStore, id, true)
-	if err != nil {
-		_ = targetStore.Close()
-		return nil, err
+// routedBlockerTimeout is the context deadline for one routed database lookup.
+// A lock timeout leaves the blocker unresolved and blocking.
+const routedBlockerTimeout = 5 * time.Second
+
+// lookupRoutedBlockers reads cross-prefix blocker issues from the databases
+// routes.jsonl assigns them to, opening each database once, read-only. It is
+// the externaldeps.IssueRouter behind single-process bd ready and bd blocked.
+func lookupRoutedBlockers(ctx context.Context, ids []string) (map[string]*types.Issue, map[string]error) {
+	found := make(map[string]*types.Issue, len(ids))
+	failed := make(map[string]error)
+	type group struct {
+		route    *prefixRoute
+		townRoot string
+		ids      []string
 	}
-	result.closeFn = func() { _ = targetStore.Close() }
-
-	if os.Getenv("BD_DEBUG_ROUTING") != "" {
-		fmt.Fprintf(os.Stderr, "[routing] Resolved %s via prefix route to %s (database: %s)\n", id, matchedRoute.Path, targetDB)
+	groups := make(map[string]*group)
+	var order []string
+	for _, id := range ids {
+		route, townRoot, err := findPrefixRoute(id)
+		if err != nil {
+			failed[id] = err
+			continue
+		}
+		key := filepath.Join(townRoot, route.Path)
+		if groups[key] == nil {
+			groups[key] = &group{route: route, townRoot: townRoot}
+			order = append(order, key)
+		}
+		groups[key].ids = append(groups[key].ids, id)
 	}
-
-	return result, nil
+	for _, key := range order {
+		g := groups[key]
+		err := func() error {
+			routeCtx, cancel := context.WithTimeout(ctx, routedBlockerTimeout)
+			defer cancel()
+			target, err := openPrefixRoute(routeCtx, g.route, g.townRoot, false)
+			if err != nil {
+				return timeoutHint(routeCtx, err)
+			}
+			defer func() { _ = target.Close() }()
+			issues, err := target.GetIssuesByIDs(routeCtx, g.ids)
+			if err != nil {
+				return timeoutHint(routeCtx, err)
+			}
+			for _, issue := range issues {
+				if issue != nil {
+					found[issue.ID] = issue
+				}
+			}
+			return nil
+		}()
+		for _, id := range g.ids {
+			if err != nil {
+				failed[id] = err
+			} else if found[id] == nil {
+				failed[id] = fmt.Errorf("not found in %s", g.route.Path)
+			}
+		}
+	}
+	return found, failed
 }
 
 // matchPrefixRoute returns the route whose prefix is the longest leading match
@@ -332,4 +414,11 @@ func getIssueWithRouting(ctx context.Context, localStore storage.DoltStorage, id
 	}
 
 	return nil, err
+}
+
+func timeoutHint(ctx context.Context, err error) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("gave up after %s, database busy or locked by another process: %w", routedBlockerTimeout, err)
+	}
+	return err
 }

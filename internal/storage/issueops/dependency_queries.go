@@ -26,9 +26,9 @@ func GetAllDependencyRecordsInTx(ctx context.Context, tx DBTX) (map[string][]*ty
 	return result, nil
 }
 
-// GetExternalBlockingDependencyRecordsInTx returns explicit external: edges
-// whose dependency type can block ready work. Cross-prefix issue IDs may share
-// depends_on_external storage, so the external: prefix check is intentional.
+// GetExternalBlockingDependencyRecordsInTx returns explicit external:
+// blocking edges and cross-prefix blocks edges. Other cross-prefix edge types
+// retain their local query behavior.
 func GetExternalBlockingDependencyRecordsInTx(ctx context.Context, tx DBTX) (map[string][]*types.Dependency, error) {
 	result := make(map[string][]*types.Dependency)
 	for _, depTable := range []string{"dependencies", "wisp_dependencies"} {
@@ -47,8 +47,9 @@ func getExternalBlockingDependencyRecordsIntoFromTable(ctx context.Context, tx D
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT issue_id, %s AS depends_on_id, type, created_at, created_by, metadata, thread_id
 		FROM %s
-		WHERE depends_on_external LIKE 'external:%%'
-		  AND type IN ('blocks', 'conditional-blocks', 'waits-for')
+		WHERE (depends_on_external LIKE 'external:%%'
+		       AND type IN ('blocks', 'conditional-blocks', 'waits-for'))
+		   OR (depends_on_external IS NOT NULL AND type = 'blocks')
 		ORDER BY issue_id
 	`, DepTargetExpr, depTable))
 	if err != nil {
